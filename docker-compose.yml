@@ -1,0 +1,18 @@
+# docker-compose.yml
+version: "3"
+services:
+  napcat:
+    environment:
+      - NAPCAT_UID=${NAPCAT_UID}
+      - NAPCAT_GID=${NAPCAT_GID}
+    ports:
+      - 3000:3000
+      - 6099:6099
+    volumes:
+      - ./napcat/QQ:/app/.config/QQ
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/plugins:/app/napcat/plugins
+      - ./napcat/shared:/app/shared
+    container_name: napcat
+    restart: always
+    image: mlikiowa/napcat-docker:latest
