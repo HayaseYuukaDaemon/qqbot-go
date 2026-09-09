@@ -9,11 +9,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"qqbot/utils"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,12 +24,12 @@ import (
 )
 
 const (
-	defaultSearchBaseURL = "https://ltn.gold-usergeneratedcontent.net"
-	Referer              = "https://hitomi.la/"
-	btreeOrder           = 16
-	btreeNodeSize        = 4096
-	maxSearchResponse    = 64 << 20
-	searchAttempts       = 3
+	defaultBaseURL    = "https://ltn.gold-usergeneratedcontent.net"
+	Referer           = "https://hitomi.la/"
+	btreeOrder        = 16
+	btreeNodeSize     = 4096
+	maxSearchResponse = 64 << 20
+	searchAttempts    = 3
 )
 
 var (
@@ -47,15 +49,6 @@ type HitomiClient struct {
 	MaxConcurrency int
 }
 
-// SearchIDs returns unique gallery IDs, newest (highest ID) first.
-// Whitespace means AND, "OR" joins adjacent positive terms, and a leading "-"
-// excludes a term. Underscores represent spaces inside a term. Empty queries
-// and queries containing only exclusions return an empty slice.
-// No language filter is added; include language:chinese when desired.
-func SearchIDs(ctx context.Context, query string) ([]int, error) {
-	return new(HitomiClient).SearchIDs(ctx, query)
-}
-
 type searchQuery struct {
 	groups   [][]string // Union within each group, intersection between groups.
 	excluded []string
@@ -64,14 +57,11 @@ type searchQuery struct {
 func NewHitomiClient(httpClient *http.Client, maxConcurrency int) *HitomiClient {
 	c := &HitomiClient{
 		HTTPClient:     httpClient,
-		BaseURL:        defaultSearchBaseURL,
+		BaseURL:        defaultBaseURL,
 		MaxConcurrency: maxConcurrency,
 	}
 	if c.HTTPClient == nil {
 		c.HTTPClient = http.DefaultClient
-	}
-	if c.BaseURL == "" {
-		c.BaseURL = defaultSearchBaseURL
 	}
 	if c.MaxConcurrency <= 0 {
 		c.MaxConcurrency = 5
@@ -79,12 +69,12 @@ func NewHitomiClient(httpClient *http.Client, maxConcurrency int) *HitomiClient 
 	return c
 }
 
-type galleryIDs map[int]struct{}
+type galleryIDs map[string]struct{}
 
 // SearchIDs runs a search using this client's transport and concurrency settings.
 // The gallery index version is fetched once per query, only for text searches.
 // Missing tags/keywords return no matches; transport and index errors are returned.
-func (c *HitomiClient) SearchIDs(ctx context.Context, query string) ([]int, error) {
+func (c *HitomiClient) SearchIDs(ctx context.Context, query string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -93,7 +83,7 @@ func (c *HitomiClient) SearchIDs(ctx context.Context, query string) ([]int, erro
 		return nil, err
 	}
 	if len(parsed.groups) == 0 {
-		return []int{}, nil
+		return nil, nil
 	}
 
 	terms := []string{}
@@ -187,7 +177,7 @@ enqueue:
 			}
 		}
 		if len(current) == 0 {
-			return []int{}, nil
+			return nil, nil
 		}
 	}
 	for _, term := range parsed.excluded {
@@ -195,12 +185,51 @@ enqueue:
 			delete(current, id)
 		}
 	}
-	ids := make([]int, 0, len(current))
+	ids := make([]string, 0, len(current))
 	for id := range current {
 		ids = append(ids, id)
 	}
-	sort.Sort(sort.Reverse(sort.IntSlice(ids)))
 	return ids, nil
+}
+
+func (c *HitomiClient) SearchComics(ctx context.Context, query string, maxCount uint) ([]Comic, error) {
+	ids, err := c.SearchIDs(ctx, query)
+	if maxCount != 0 && len(ids) > int(maxCount) {
+		return nil, fmt.Errorf("Max count reach, current %d", maxCount)
+	}
+	if err != nil {
+		return nil, err
+	}
+	results := utils.NewResult[string, Comic]()
+	wg := sync.WaitGroup{}
+	jobs := make(chan string)
+	for range max(c.MaxConcurrency, len(ids)) {
+		wg.Go(func() {
+			for id := range jobs {
+				comic, err := c.GetComic(ctx, id)
+				if err != nil {
+					results.SetError(id, err)
+				} else {
+					results.SetResult(id, comic)
+				}
+			}
+		})
+	}
+enqueue:
+	for _, id := range ids {
+		select {
+		case jobs <- id:
+		case <-ctx.Done():
+			break enqueue
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	comics := make([]Comic, 0, len(ids))
+	for _, comic := range results.CollectResults() {
+		comics = append(comics, comic)
+	}
+	return comics, results.PackErrors()
 }
 
 func (c *HitomiClient) GetCover(ctx context.Context, galleryID int) (io.ReadCloser, error) {
@@ -218,6 +247,142 @@ func (c *HitomiClient) GetCover(ctx context.Context, galleryID int) (io.ReadClos
 		return nil, fmt.Errorf("hitomi: unexpected status code %d", resp.StatusCode)
 	}
 	return resp.Body, nil
+}
+
+type Comic struct {
+	ID       string   `json:"id"`
+	Title    string   `json:"title"`
+	Language string   `json:"language"`
+	Artists  []string `json:"artists"`
+	Tags     []struct {
+		Tag    string `json:"tag"`
+		Gender string `json:"gender"`
+	} `json:"tags"`
+	Characters    []string   `json:"characters"`
+	Parodys       []string   `json:"parodys"`
+	PublishedTime *time.Time `json:"published_time"`
+}
+
+func (c *Comic) UnmarshalJSON(b []byte) error {
+	type rawComic struct {
+		ID       string `json:"id"`
+		Title    string `json:"title"`
+		Language string `json:"language"`
+		Artists  []struct {
+			Artist string `json:"artist"`
+		} `json:"artists"`
+		Tags []struct {
+			Tag    string `json:"tag"`
+			Male   string `json:"male"`
+			Female string `json:"female"`
+		} `json:"tags"`
+		Characters []struct {
+			Character string `json:"character"`
+		} `json:"characters"`
+		Parodys []struct {
+			Parody string `json:"parody"`
+		} `json:"parodys"`
+		DatePublished string `json:"datepublished"` // 例如 2025-12-30
+	}
+
+	var rc rawComic
+	if err := json.Unmarshal(b, &rc); err != nil {
+		return err
+	}
+
+	// 先构造临时对象，全部转换成功后再赋给 c。
+	// 这样如果中途日期解析失败，不会让 c 处于半更新状态。
+	result := Comic{
+		ID:       rc.ID,
+		Title:    rc.Title,
+		Language: rc.Language,
+	}
+
+	// artists
+	result.Artists = make([]string, len(rc.Artists))
+	for i, artist := range rc.Artists {
+		result.Artists[i] = artist.Artist
+	}
+
+	// tags
+	result.Tags = make([]struct {
+		Tag    string `json:"tag"`
+		Gender string `json:"gender"`
+	}, len(rc.Tags))
+
+	for i, tag := range rc.Tags {
+		result.Tags[i].Tag = tag.Tag
+
+		switch {
+		case tag.Male != "" && tag.Female != "":
+			return fmt.Errorf(
+				"tag %q has both male and female fields",
+				tag.Tag,
+			)
+
+		case tag.Male != "":
+			result.Tags[i].Gender = "male"
+
+		case tag.Female != "":
+			result.Tags[i].Gender = "female"
+
+		default:
+			result.Tags[i].Gender = ""
+		}
+	}
+
+	// characters
+	result.Characters = make([]string, len(rc.Characters))
+	for i, character := range rc.Characters {
+		result.Characters[i] = character.Character
+	}
+
+	// parodys
+	result.Parodys = make([]string, len(rc.Parodys))
+	for i, parody := range rc.Parodys {
+		result.Parodys[i] = parody.Parody
+	}
+
+	// published time
+	if rc.DatePublished != "" {
+		t, err := time.Parse("2006-01-02", rc.DatePublished)
+		if err != nil {
+			return fmt.Errorf(
+				"invalid datepublished %q: %w",
+				rc.DatePublished,
+				err,
+			)
+		}
+		result.PublishedTime = &t
+	}
+
+	*c = result
+	return nil
+}
+
+func (c *HitomiClient) GetComic(ctx context.Context, galleryID string) (Comic, error) {
+	if galleryID == "" {
+		return Comic{}, fmt.Errorf("Require gallery id")
+	}
+	resp, err := c.get(ctx, fmt.Sprintf("/galleries/%s.js", galleryID), nil)
+	if err != nil {
+		return Comic{}, err
+	}
+	if !bytes.Contains(resp, []byte("galleryinfo")) {
+		return Comic{}, errors.New("galleryinfo not found")
+	}
+
+	start := bytes.Index(resp, []byte("{"))
+	end := bytes.LastIndex(resp, []byte("}"))
+	if start < 0 || end <= start {
+		return Comic{}, errors.New("galleryinfo json object not found")
+	}
+
+	var comic Comic
+	if err := json.Unmarshal(resp[start:end+1], &comic); err != nil {
+		return comic, err
+	}
+	return comic, nil
 }
 
 func parseSearchQuery(query string) (searchQuery, error) {
@@ -325,7 +490,7 @@ func decodeGalleryIDs(data []byte) (galleryIDs, error) {
 	}
 	ids := make(galleryIDs, len(data)/4)
 	for i := 0; i < len(data); i += 4 {
-		ids[int(binary.BigEndian.Uint32(data[i:i+4]))] = struct{}{}
+		ids[strconv.Itoa(int(binary.BigEndian.Uint32(data[i:i+4])))] = struct{}{}
 	}
 	return ids, nil
 }

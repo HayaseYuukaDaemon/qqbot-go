@@ -69,26 +69,27 @@ func main() {
 	}
 	slog.Info("Login info", "info", resp.Nickname)
 	hitomiClient := hitomi.NewHitomiClient(nil, 5)
+
+	handleHitomi := func(ev *event.GroupMessage) error {
+		groupID := strconv.Itoa(int(ev.GroupID))
+		slog.Debug("Group message", "type", string(ev.PostType()), "gid", groupID, "sender", ev.Sender.Nickname, "message", ev.Message.Text())
+		msgText := ev.Message.Text()
+		queryStr, found := strings.CutPrefix(msgText, "/h ")
+		if !found {
+			return nil
+		}
+		hitomiClient.SearchComics(ctx, queryStr, 5)
+		return nil
+	}
+
 	for {
 		select {
 		case ev := <-client.Events():
 			switch ev := ev.(type) {
 			case *event.GroupMessage:
-				userID := ev.Sender.UserID
-				groupID := string(ev.GroupID)
-				slog.Debug("Group message", "type", string(ev.PostType()), "gid", groupID, "sender", ev.Sender.Nickname, "message", ev.Message.Text())
-				msgText := ev.Message.Text()
-				hitomiIDStr, found := strings.CutPrefix(msgText, "/h ")
-				if !found {
-					continue
-				}
-
-				if err != nil {
-					slog.Warn("failed to construct msg", "err", err)
-					continue
-				}
-				hitomiID, err := strconv.Atoi(hitomiIDStr)
-				if err != nil {
+				if err := handleHitomi(ev); err != nil {
+					userID := ev.Sender.UserID
+					groupID := strconv.Itoa(int(ev.GroupID))
 					replyMsg, err := api.NewOB11Message([]message.Segment{message.Reply(userID.Int64()), message.Text("Invalid hitomi ID")})
 					if err != nil {
 						slog.Warn("failed to construct reply msg", "err", err)
@@ -98,18 +99,11 @@ func main() {
 						GroupID: &groupID,
 						Message: replyMsg,
 					})
-
 					if err != nil {
 						slog.Warn("failed to send reply msg", "err", err)
 					}
 					continue
 				}
-				gallery, err := hitomiClient.SearchIDs(ctx, hitomiID)
-				if err != nil {
-					slog.Warn("failed to search hitomi IDs", "err", err)
-					continue
-				}
-				// Process the search results (e.g., send them back to the user)
 			}
 		case <-ctx.Done():
 			slog.Info("Context done")
