@@ -1,0 +1,4 @@
+[submodule "onebot-go-sdk"]
+	path = onebot-go-sdk
+	url = https://github.com/HayaseYuukaDaemon/onebot-go-sdk.git
+	branch = feat/extensible-codec
