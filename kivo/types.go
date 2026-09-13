@@ -1,7 +1,7 @@
 package kivo
 
 import (
-	"encoding/json"
+	"log/slog"
 	"time"
 )
 
@@ -14,82 +14,47 @@ const (
 	Administrator Capability = "admin"
 )
 
-type MemberCapability struct {
-	MemberID   string     `gorm:"primaryKey"`
-	Capability Capability `gorm:"primaryKey"`
+type BotConfig struct {
+	DBPath string `json:"db_path"`
+	Debug  bool   `json:"debug"`
+
+	// 运行时配置
+	Logger *slog.Logger `json:"-"`
 }
 
 type Member struct {
-	Name      string `json:"name"`
+	Name      string `json:"name" gorm:"unique"`
 	ID        string `json:"id" gorm:"primaryKey"` // 设计为qq号
 	Available bool   `json:"available"`
 
-	CapabilityRows []MemberCapability `gorm:"foreignKey:MemberID" json:"-"`
+	Capabilities []Capability `gorm:"-"`
 }
 
-func (m *Member) MarshalJSON() ([]byte, error) {
-	type aliasMember Member
+type memberCapability struct {
+	MemberID   string     `gorm:"primaryKey"`
+	Capability Capability `gorm:"primaryKey"`
 
-	aux := struct {
-		*aliasMember
-		Capabilities []Capability `json:"capabilities"`
-	}{
-		aliasMember: (*aliasMember)(m),
-	}
-
-}
-
-func (m *Member) UnmarshalJSON(b []byte) error {
-	type aliasMember Member
-
-	aux := struct {
-		*aliasMember
-		Capabilities []Capability `json:"capabilities"`
-	}{
-		aliasMember: (*aliasMember)(m),
-	}
-
-	if err := json.Unmarshal(b, &aux); err != nil {
-		return err
-	}
-
-	m.CapabilityRows = make([]MemberCapability, len(aux.Capabilities))
-	for i, cap := range aux.Capabilities {
-		m.CapabilityRows[i] = MemberCapability{
-			MemberID:   m.ID,
-			Capability: cap,
-		}
-	}
-
-	return nil
-}
-
-func (m Member) Capabilities() []Capability {
-	result := make([]Capability, 0, len(m.CapabilityRows))
-
-	for _, c := range m.CapabilityRows {
-		result = append(result, c.Capability)
-	}
-
-	return result
+	Member Member `gorm:"foreignKey:MemberID"`
 }
 
 type Project struct {
-	UUID                 string       `json:"uuid" gorm:"primaryKey"`
-	Name                 string       `json:"name"`
-	RequiredCapabilities []Capability `json:"required_capabilities"`
-	Desc                 string       `json:"desc"`
-}
+	UUID string `json:"uuid" gorm:"primaryKey"`
+	Name string `json:"name"`
+	Desc string `json:"desc"`
 
-type ProjectSet struct {
-	UUID     string    `json:"uuid" gorm:"primaryKey"`
-	Name     string    `json:"name"`
-	Projects []Project `json:"projects"`
+	RequiredCapabilities []Capability `json:"required_capabilities" gorm:"-"`
 
 	// 周期属性
-	StartAt  *time.Time     `json:"start_at"`
-	EndAt    *time.Time     `json:"end_at"`
-	Interval *time.Duration `json:"interval"`
+	StartAt  *time.Time     `json:"start_at"` // 项目开始于
+	EndAt    *time.Time     `json:"end_at"`   // 项目终止于
+	Interval *time.Duration `json:"interval"` // 周期性项目的Interval
+}
+
+type projectCapability struct {
+	ProjectID  string     `gorm:"primaryKey"`
+	Capability Capability `gorm:"primaryKey"`
+
+	Project Project `gorm:"foreignKey:ProjectID;references:UUID"`
 }
 
 type TaskStatus string
@@ -106,12 +71,20 @@ const (
 )
 
 type Task struct {
-	UUID              string     `json:"uuid" gorm:"primaryKey"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at" `
-	ProjectID         string     `json:"project_id"`
-	Status            TaskStatus `json:"status"`
-	AllocatedMemberID string     `json:"allocated_member_id"`
+	UUID      string     `json:"uuid" gorm:"primaryKey"`
+	Desc      string     `json:"desc"`
+	CreatedAt time.Time  `json:"created_at"` // 任务创建即视为开始
+	UpdatedAt time.Time  `json:"updated_at"` // 状态等变更
+	EndAt     time.Time  `json:"end_at"`     // 任务截止日期, 带interval的project直接用created+interval
+	Status    TaskStatus `json:"status" gorm:"not null;check:task_status_check,status IN ('created','allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('created','pending','cancelled')"`
+
+	ProjectID string  `json:"project_id"`
+	Project   Project `json:"project"`
+
+	AllocatedMemberID *string `json:"allocated_member_id"` // 可空, 如果为空则说明未分配
+	AllocatedMember   *Member `json:"allocated_member" gorm:"constraint:OnDelete:SET NULL"`
+
+	RelatedPath []string `json:"related_path" gorm:"serializer:json;type:text"`
 }
 
 type MotionType string
@@ -125,9 +98,11 @@ const (
 
 type Motion struct {
 	UUID       string     `json:"uuid" gorm:"primaryKey"`
-	ReceivedAt time.Time  `json:"received_at"`
-	MemberID   string     `json:"member_id"` // 如果为空则说明是由Bot发起
+	CreatedAt  time.Time  `json:"received_at"`
 	Type       MotionType `json:"type"`
 	RawContent string     `json:"raw_content"`
 	ContentPtr string     `json:"content_ptr"` // 可空
+
+	MemberID *string `json:"member_id"` // 如果为空则说明是由Bot发起
+	Member   *Member `json:"member"`
 }
