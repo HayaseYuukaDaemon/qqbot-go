@@ -60,7 +60,6 @@ type projectCapability struct {
 type TaskStatus string
 
 const (
-	TaskCreated   TaskStatus = "created"
 	TaskAllocated TaskStatus = "allocated"
 	TaskAccepted  TaskStatus = "accepted"
 	TaskPending   TaskStatus = "pending"
@@ -76,7 +75,7 @@ type Task struct {
 	CreatedAt time.Time  `json:"created_at"` // 任务创建即视为开始
 	UpdatedAt time.Time  `json:"updated_at"` // 状态等变更
 	EndAt     time.Time  `json:"end_at"`     // 任务截止日期, 带interval的project直接用created+interval
-	Status    TaskStatus `json:"status" gorm:"not null;check:task_status_check,status IN ('created','allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('created','pending','cancelled')"`
+	Status    TaskStatus `json:"status" gorm:"not null;check:task_status_check,status IN ('allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('pending','cancelled')"`
 
 	ProjectID string  `json:"project_id"`
 	Project   Project `json:"project"`
