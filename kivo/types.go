@@ -48,6 +48,8 @@ type Project struct {
 	StartAt  *time.Time     `json:"start_at"` // 项目开始于
 	EndAt    *time.Time     `json:"end_at"`   // 项目终止于
 	Interval *time.Duration `json:"interval"` // 周期性项目的Interval
+
+	RelatedPaths []string `json:"related_paths" gorm:"serializer:json;type:text"`
 }
 
 type projectCapability struct {
@@ -75,13 +77,13 @@ type Task struct {
 	CreatedAt time.Time  `json:"created_at"` // 任务创建即视为开始
 	UpdatedAt time.Time  `json:"updated_at"` // 状态等变更
 	EndAt     time.Time  `json:"end_at"`     // 任务截止日期, 带interval的project直接用created+interval
-	Status    TaskStatus `json:"status" gorm:"not null;check:task_status_check,status IN ('allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('pending','cancelled')"`
+	Status    TaskStatus `json:"status" gorm:"not null;default:allocated;check:task_status_check,status IN ('allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('pending','cancelled')"`
 
-	ProjectID string  `json:"project_id"`
-	Project   Project `json:"project"`
+	ProjectID string  `json:"project_id" gorm:"not null;default:null"`
+	Project   Project `json:"project" gorm:"foreignKey:ProjectID;references:UUID;constraint:OnDelete:RESTRICT"`
 
 	AllocatedMemberID *string `json:"allocated_member_id"` // 可空, 如果为空则说明未分配
-	AllocatedMember   *Member `json:"allocated_member" gorm:"constraint:OnDelete:SET NULL"`
+	AllocatedMember   *Member `json:"allocated_member" gorm:"foreignKey:AllocatedMemberID;references:ID;constraint:OnDelete:SET NULL"`
 
 	RelatedPath []string `json:"related_path" gorm:"serializer:json;type:text"`
 }

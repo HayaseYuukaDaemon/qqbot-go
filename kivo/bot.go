@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -31,10 +32,9 @@ func (kb *KivoBot) initDB(dbPath string) error {
 			LogLevel: logLevel,
 		}),
 	}
-	db, err := gorm.Open(sqlite.Open(dbPath), dbConfig)
-
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_foreign_keys=on"), dbConfig)
 	if err != nil {
-		return fmt.Errorf("failed to connect database: %w", err)
+		return fmt.Errorf("failed to open db: %w", err)
 	}
 	if err := db.AutoMigrate(&Member{}, &memberCapability{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
@@ -45,8 +45,86 @@ func (kb *KivoBot) initDB(dbPath string) error {
 	if err := db.AutoMigrate(&Task{}, &Motion{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
+
+	fmt.Println(
+		db.Migrator().HasConstraint(&Task{}, "AllocatedMember"),
+	)
+
+	if err := db.Exec(`
+		CREATE TRIGGER IF NOT EXISTS task_member_available_on_insert
+		BEFORE INSERT ON tasks
+		WHEN NEW.allocated_member_id IS NOT NULL
+		 AND NOT EXISTS (
+			SELECT 1
+			FROM members
+			WHERE id = NEW.allocated_member_id
+			  AND available = 1
+		 )
+		BEGIN
+			SELECT RAISE(ABORT, 'allocated member is not available');
+		END;
+	`).Error; err != nil {
+		return fmt.Errorf("failed to create db trigger task_member_available_on_insert: %w", err)
+	}
+
+	if err := db.Exec(`
+		CREATE TRIGGER IF NOT EXISTS task_member_available_on_update
+		BEFORE UPDATE OF allocated_member_id ON tasks
+		WHEN NEW.allocated_member_id IS NOT NULL
+		 AND NOT EXISTS (
+			SELECT 1
+			FROM members
+			WHERE id = NEW.allocated_member_id
+			  AND available = 1
+		 )
+		BEGIN
+			SELECT RAISE(ABORT, 'allocated member is not available');
+		END;
+	`).Error; err != nil {
+		return fmt.Errorf("failed to create db trigger task_member_available_on_update: %w", err)
+	}
+
 	kb.db = db
 	return nil
+}
+
+type QueryTaskParams struct {
+	Name                 *string
+	AllocatedMemberID    *string
+	RequiredCapabilities *[]Capability
+}
+
+func (kb *KivoBot) QueryTasks(ctx context.Context, params QueryMemberParams) ([]Task, error) {
+	return nil, nil
+}
+
+func (kb *KivoBot) CreateTask(ctx context.Context, task *Task) error {
+	if kb.db == nil {
+		return ErrDBNotInit
+	}
+	err := gorm.G[Task](kb.db).Create(ctx, task)
+	if err == nil {
+		return nil
+	}
+	if sqliteErr, ok := errors.AsType[sqlite3.Error](err); ok {
+		switch sqliteErr.ExtendedCode {
+		case sqlite3.ErrConstraintCheck:
+			return fmt.Errorf("failed to create task: check constraint violated: %w", err)
+		case sqlite3.ErrConstraintTrigger:
+			var memberID *string
+			if task.AllocatedMemberID != nil {
+				memberID = task.AllocatedMemberID
+			} else {
+				memberID = &task.AllocatedMember.ID
+			}
+			return fmt.Errorf("%w: member: %s", err, *memberID)
+		}
+	}
+	return err
+}
+
+func (kb *KivoBot) QueryTaskByMember(ctx context.Context, memberID string) ([]Task, error) {
+	return nil, nil
 }
 
 func (kb *KivoBot) CreateProject(ctx context.Context, project *Project) error {
@@ -120,11 +198,66 @@ func (kb *KivoBot) QueryProjects(ctx context.Context, name string) ([]Project, e
 	return gorm.G[Project](kb.db).Where("name = ?", name).Find(ctx)
 }
 
-func (kb *KivoBot) QueryMembersByName(ctx context.Context, name string) (Member, error) {
+type QueryMemberParams struct {
+	Name         *string
+	Capabilities *[]Capability
+	Available    *bool
+}
+
+// QueryMembers 对所有非 nil 条件取交集，Name 精确匹配，Capabilities 要求全部具备。
+// nil 或空能力列表不限制能力；返回匹配成员的全部能力，包括没有能力的成员。
+func (kb *KivoBot) QueryMembers(ctx context.Context, params QueryMemberParams) ([]Member, error) {
 	if kb.db == nil {
-		return Member{}, ErrDBNotInit
+		return nil, ErrDBNotInit
 	}
-	return gorm.G[Member](kb.db).Where("name = ?", name).First(ctx)
+
+	conditions := make(map[string]any)
+	if params.Name != nil {
+		conditions["name"] = *params.Name
+	}
+	if params.Available != nil {
+		conditions["available"] = *params.Available
+	}
+	query := gorm.G[Member](kb.db).Where(conditions)
+	if params.Capabilities != nil && len(*params.Capabilities) > 0 {
+		// 能力按集合匹配，重复的查询条件不增加所需能力数量。
+		seen := make(map[Capability]struct{})
+		caps := make([]Capability, 0, len(*params.Capabilities))
+		for _, cap := range *params.Capabilities {
+			if _, ok := seen[cap]; !ok {
+				seen[cap] = struct{}{}
+				caps = append(caps, cap)
+			}
+		}
+		subQuery := kb.db.Model(&memberCapability{}).
+			Select("member_id").Where("capability IN ?", caps).
+			Group("member_id").Having("COUNT(DISTINCT capability) = ?", len(caps))
+		query = query.Where("id IN (?)", subQuery)
+	}
+	members, err := query.Find(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find members: %w", err)
+	}
+	if len(members) == 0 {
+		return members, nil
+	}
+
+	memberIDs := make([]string, 0, len(members))
+	memberIndex := make(map[string]int, len(members))
+	for i, member := range members {
+		memberIDs = append(memberIDs, member.ID)
+		memberIndex[member.ID] = i
+	}
+	rows, err := gorm.G[memberCapability](kb.db).Where("member_id IN ?", memberIDs).Find(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find member capabilities: %w", err)
+	}
+	for _, row := range rows {
+		i := memberIndex[row.MemberID]
+		members[i].Capabilities = append(members[i].Capabilities, row.Capability)
+	}
+
+	return members, nil
 }
 
 func (kb *KivoBot) CreateMember(ctx context.Context, member *Member) error {
@@ -209,37 +342,6 @@ func (kb *KivoBot) GetMember(ctx context.Context, memberID string) (Member, erro
 	}
 
 	return *member, nil
-}
-
-func (kb *KivoBot) QueryMembersByCap(ctx context.Context, caps []Capability) ([]Member, error) {
-	if kb.db == nil {
-		return nil, ErrDBNotInit
-	}
-
-	query := kb.db.Model(&memberCapability{}).Select("member_id").Where("capability IN ?", caps)
-	rows, err := gorm.G[memberCapability](kb.db).Preload("Member", nil).Where("member_id IN (?)", query).Find(ctx)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to find member capabilities: %w", err)
-	}
-	members := make([]Member, 0)
-	memberIndex := make(map[string]int)
-
-	for _, row := range rows {
-		i, ok := memberIndex[row.MemberID]
-		if !ok {
-			i = len(members)
-			memberIndex[row.MemberID] = i
-			members = append(members, row.Member)
-		}
-
-		members[i].Capabilities = append(
-			members[i].Capabilities,
-			row.Capability,
-		)
-	}
-
-	return members, nil
 }
 
 func (kb *KivoBot) AddCapability(ctx context.Context, memberID string, cap Capability) error {

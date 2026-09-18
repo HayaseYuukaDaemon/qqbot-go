@@ -3,14 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"qqbot/kivo"
-
-	"gorm.io/gorm"
 )
 
 var GROUP_MAP = map[string]kivo.Capability{
@@ -75,15 +72,15 @@ func main() {
 		}
 		slog.Info("处理Group", "group_id", group.ID, "capability", capability)
 		for _, m := range group.Members {
-			member, err := kb.QueryMembersByName(ctx, m.Name)
+			members, err := kb.QueryMembers(ctx, kivo.QueryMemberParams{Name: &m.Name})
 			if err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					slog.Warn("成员不存在, 跳过", "name", m.Name)
-					continue
-				} else {
-					panic(err)
-				}
+				panic(err)
 			}
+			if len(members) == 0 {
+				slog.Warn("成员不存在, 跳过", "name", m.Name)
+				continue
+			}
+			member := members[0] // Name 有唯一约束。
 			slog.Info("为成员添加能力", "name", m.Name, "cap", capability)
 			if err := kb.AddCapability(ctx, member.ID, capability); err != nil {
 				panic(err)
