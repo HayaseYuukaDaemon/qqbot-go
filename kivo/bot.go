@@ -32,9 +32,12 @@ func (kb *KivoBot) initDB(dbPath string) error {
 			LogLevel: logLevel,
 		}),
 	}
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_foreign_keys=on"), dbConfig)
+	db, err := gorm.Open(sqlite.Open(dbPath), dbConfig)
 	if err != nil {
 		return fmt.Errorf("failed to open db: %w", err)
+	}
+	if err := db.Exec("PRAGMA foreign_keys = ON;").Error; err != nil {
+		return fmt.Errorf("failed to enable foreign key: %w", err)
 	}
 	if err := db.AutoMigrate(&Member{}, &memberCapability{}); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
@@ -89,13 +92,72 @@ func (kb *KivoBot) initDB(dbPath string) error {
 }
 
 type QueryTaskParams struct {
-	Name                 *string
-	AllocatedMemberID    *string
-	RequiredCapabilities *[]Capability
+	ProjectID         *string
+	AllocatedMemberID *string
 }
 
-func (kb *KivoBot) QueryTasks(ctx context.Context, params QueryMemberParams) ([]Task, error) {
-	return nil, nil
+// QueryTasks 对所有非 nil 条件取交集，ID 精确匹配，包括非 nil 的空字符串。
+// 返回任务及其项目、已分配成员的完整能力；未分配任务的成员保持 nil。
+func (kb *KivoBot) QueryTasks(ctx context.Context, params QueryTaskParams) ([]Task, error) {
+	if kb.db == nil {
+		return nil, ErrDBNotInit
+	}
+	conditions := make(map[string]any)
+	if params.ProjectID != nil {
+		conditions["project_id"] = *params.ProjectID
+	}
+	if params.AllocatedMemberID != nil {
+		conditions["allocated_member_id"] = *params.AllocatedMemberID
+	}
+	query := gorm.G[Task](kb.db).Where(conditions)
+	tasks, err := query.Preload("Project", nil).Preload("AllocatedMember", nil).Find(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find tasks: %w", err)
+	}
+	if len(tasks) == 0 {
+		return tasks, nil
+	}
+
+	// 批量补齐 gorm:"-" 的能力字段，避免每个任务分别查询关联对象。
+	projectCaps := make(map[string][]Capability)
+	memberCaps := make(map[string][]Capability)
+	var projectIDs, memberIDs []string
+	for _, task := range tasks {
+		if _, ok := projectCaps[task.ProjectID]; !ok {
+			projectIDs = append(projectIDs, task.ProjectID)
+			projectCaps[task.ProjectID] = nil
+		}
+		if task.AllocatedMemberID != nil {
+			id := *task.AllocatedMemberID
+			if _, ok := memberCaps[id]; !ok {
+				memberIDs = append(memberIDs, id)
+				memberCaps[id] = nil
+			}
+		}
+	}
+	projectRows, err := gorm.G[projectCapability](kb.db).Where("project_id IN ?", projectIDs).Find(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find task project capabilities: %w", err)
+	}
+	for _, row := range projectRows {
+		projectCaps[row.ProjectID] = append(projectCaps[row.ProjectID], row.Capability)
+	}
+	if len(memberIDs) > 0 {
+		memberRows, err := gorm.G[memberCapability](kb.db).Where("member_id IN ?", memberIDs).Find(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find task member capabilities: %w", err)
+		}
+		for _, row := range memberRows {
+			memberCaps[row.MemberID] = append(memberCaps[row.MemberID], row.Capability)
+		}
+	}
+	for i := range tasks {
+		tasks[i].Project.RequiredCapabilities = projectCaps[tasks[i].ProjectID]
+		if member := tasks[i].AllocatedMember; member != nil {
+			member.Capabilities = memberCaps[member.ID]
+		}
+	}
+	return tasks, nil
 }
 
 func (kb *KivoBot) CreateTask(ctx context.Context, task *Task) error {
@@ -121,10 +183,6 @@ func (kb *KivoBot) CreateTask(ctx context.Context, task *Task) error {
 		}
 	}
 	return err
-}
-
-func (kb *KivoBot) QueryTaskByMember(ctx context.Context, memberID string) ([]Task, error) {
-	return nil, nil
 }
 
 func (kb *KivoBot) CreateProject(ctx context.Context, project *Project) error {

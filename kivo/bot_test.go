@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
@@ -276,6 +277,125 @@ func TestBotCreateRollsBackOnDuplicateCapability(t *testing.T) {
 	})
 }
 
+func TestBotQueryTasks(t *testing.T) {
+	ctx := t.Context()
+	bot := newTestBot(t)
+	yuuka := Member{ID: "123", Name: "HayaseYuuka", Available: true, Capabilities: []Capability{Assistant}}
+	hina := Member{ID: "456", Name: "SorasakiHina", Available: true, Capabilities: []Capability{Translator}}
+	requireNoError(t, bot.CreateMember(ctx, &yuuka))
+	requireNoError(t, bot.CreateMember(ctx, &hina))
+	forms := Project{UUID: "forms", Name: "same-name", RequiredCapabilities: []Capability{FormFilling, Assistant}, RelatedPaths: []string{"forms/template.json"}}
+	admin := Project{UUID: "admin", Name: "same-name", RequiredCapabilities: []Capability{FormFilling, Administrator}}
+	noCaps := Project{UUID: "no-caps", Name: "no requirements"}
+	requireNoError(t, bot.CreateProject(ctx, &forms))
+	requireNoError(t, bot.CreateProject(ctx, &admin))
+	// 直接准备无能力要求的项目，独立验证查询能保留没有能力关联记录的任务。
+	requireNoError(t, bot.db.Create(&noCaps).Error)
+	projects := map[string]Project{forms.UUID: forms, admin.UUID: admin, noCaps.UUID: noCaps}
+	tasks := []Task{
+		{UUID: "forms-yuuka", ProjectID: forms.UUID, AllocatedMemberID: &yuuka.ID},
+		{UUID: "forms-hina", ProjectID: forms.UUID, AllocatedMemberID: &hina.ID},
+		{UUID: "forms-pending", ProjectID: forms.UUID, Status: TaskPending},
+		{UUID: "admin-yuuka", ProjectID: admin.UUID, AllocatedMemberID: &yuuka.ID, Status: TaskCompleted},
+		{UUID: "admin-cancelled", ProjectID: admin.UUID, Status: TaskCancelled},
+		{UUID: "no-caps-hina", ProjectID: noCaps.UUID, AllocatedMemberID: &hina.ID},
+	}
+	for i := range tasks {
+		tasks[i].Desc = "description: " + tasks[i].UUID
+		tasks[i].EndAt = time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+		tasks[i].RelatedPath = []string{"任务/" + tasks[i].UUID}
+		requireNoError(t, bot.CreateTask(ctx, &tasks[i]))
+	}
+	// 查询历史任务不因成员停用或能力移除而漏掉记录。
+	requireNoError(t, bot.DisableMember(ctx, hina.ID))
+	requireNoError(t, bot.RemoveCapability(ctx, hina.ID, Translator))
+	hina.Available = false
+	hina.Capabilities = nil
+	members := map[string]Member{yuuka.ID: yuuka, hina.ID: hina}
+	empty, missing := "", "' OR 1=1 --"
+	for _, tt := range []struct {
+		name   string
+		params QueryTaskParams
+		want   []Task
+	}{
+		{"no filters includes all statuses and unassigned tasks", QueryTaskParams{}, tasks},
+		{"project ID is exact despite shared names", QueryTaskParams{ProjectID: &forms.UUID}, tasks[:3]},
+		{"project without capabilities", QueryTaskParams{ProjectID: &noCaps.UUID}, tasks[5:]},
+		{"empty project ID is a condition", QueryTaskParams{ProjectID: &empty}, nil},
+		{"missing project ID is bound as a value", QueryTaskParams{ProjectID: &missing}, nil},
+		{"allocated member", QueryTaskParams{AllocatedMemberID: &yuuka.ID}, []Task{tasks[0], tasks[3]}},
+		{"disabled member without capabilities", QueryTaskParams{AllocatedMemberID: &hina.ID}, []Task{tasks[1], tasks[5]}},
+		{"empty member ID does not mean unassigned", QueryTaskParams{AllocatedMemberID: &empty}, nil},
+		{"missing member ID", QueryTaskParams{AllocatedMemberID: &missing}, nil},
+		{"project and member conditions both match", QueryTaskParams{ProjectID: &forms.UUID, AllocatedMemberID: &hina.ID}, []Task{tasks[1]}},
+		{"project conflicts with member", QueryTaskParams{ProjectID: &noCaps.UUID, AllocatedMemberID: &yuuka.ID}, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := bot.QueryTasks(ctx, tt.params)
+			requireNoError(t, err)
+			if len(got) != len(tt.want) {
+				t.Fatalf("QueryTasks = %+v, want %+v", got, tt.want)
+			}
+			wantByID := make(map[string]Task, len(tt.want))
+			for _, task := range tt.want {
+				wantByID[task.UUID] = task
+			}
+			for _, task := range got {
+				want, ok := wantByID[task.UUID]
+				if !ok {
+					t.Fatalf("unexpected or duplicate task: %+v", task)
+				}
+				delete(wantByID, task.UUID)
+				if task.ProjectID != want.ProjectID || task.Status != want.Status || task.Desc != want.Desc ||
+					!task.CreatedAt.Equal(want.CreatedAt) || !task.UpdatedAt.Equal(want.UpdatedAt) || !task.EndAt.Equal(want.EndAt) ||
+					!slices.Equal(task.RelatedPath, want.RelatedPath) {
+					t.Fatalf("task = %+v, want %+v", task, want)
+				}
+				project := projects[want.ProjectID]
+				if task.Project.UUID != project.UUID || task.Project.Name != project.Name || !slices.Equal(task.Project.RelatedPaths, project.RelatedPaths) {
+					t.Fatalf("project = %+v, want %+v", task.Project, project)
+				}
+				requireCapabilities(t, task.Project.RequiredCapabilities, project.RequiredCapabilities)
+				if want.AllocatedMemberID == nil {
+					if task.AllocatedMemberID != nil || task.AllocatedMember != nil {
+						t.Fatalf("unassigned task has member: %+v", task)
+					}
+					continue
+				}
+				member := members[*want.AllocatedMemberID]
+				if task.AllocatedMemberID == nil || *task.AllocatedMemberID != member.ID || task.AllocatedMember == nil {
+					t.Fatalf("task member missing or incorrect: %+v", task)
+				}
+				if task.AllocatedMember.ID != member.ID || task.AllocatedMember.Name != member.Name || task.AllocatedMember.Available != member.Available {
+					t.Fatalf("member = %+v, want %+v", task.AllocatedMember, member)
+				}
+				requireCapabilities(t, task.AllocatedMember.Capabilities, member.Capabilities)
+			}
+		})
+	}
+	t.Run("cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if _, err := bot.QueryTasks(ctx, QueryTaskParams{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("QueryTasks = %v, want context cancelled", err)
+		}
+	})
+	t.Run("database not initialized", func(t *testing.T) {
+		var bot KivoBot
+		if _, err := bot.QueryTasks(t.Context(), QueryTaskParams{}); !errors.Is(err, ErrDBNotInit) {
+			t.Fatalf("QueryTasks = %v, want ErrDBNotInit", err)
+		}
+	})
+	t.Run("empty database", func(t *testing.T) {
+		bot := newTestBot(t)
+		tasks, err := bot.QueryTasks(t.Context(), QueryTaskParams{})
+		requireNoError(t, err)
+		if len(tasks) != 0 {
+			t.Fatalf("QueryTasks = %+v, want no tasks", tasks)
+		}
+	})
+}
+
 func TestBotCreateTask(t *testing.T) {
 	ctx := t.Context()
 	bot := newTestBot(t)
@@ -334,7 +454,7 @@ func TestBotCreateTask(t *testing.T) {
 				return
 			}
 			requireNoError(t, err)
-			// 尚无任务读取接口，直接读库验证创建结果和 JSON 字段持久化。
+			// 直接读库验证创建结果，避免创建测试依赖查询接口的实现。
 			var got Task
 			requireNoError(t, bot.db.Where("uuid = ?", task.UUID).First(&got).Error)
 			if got.ProjectID != project.UUID || got.Status != tt.wantStatus {
