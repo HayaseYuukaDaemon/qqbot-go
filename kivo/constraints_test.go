@@ -117,3 +117,59 @@ func TestBotDeleteMemberClearsOptionalTaskAssignment(t *testing.T) {
 		})
 	}
 }
+
+func TestBotTaskAcceptedTransitions(t *testing.T) {
+	// 直接执行 SQL，确保绕过业务方法时数据库仍然强制检查状态流转。
+	for _, tt := range []struct {
+		from, to TaskStatus
+		rejected bool
+	}{
+		{TaskAllocated, TaskAccepted, false},
+		{TaskPending, TaskAccepted, false},
+		{TaskBlocked, TaskAccepted, false},
+		{TaskRunning, TaskAccepted, true},
+		{TaskCancelled, TaskAccepted, true},
+		{TaskCompleted, TaskAccepted, true},
+		{TaskAccepted, TaskAccepted, true},
+		{TaskAccepted, TaskRunning, false},
+		{TaskCompleted, TaskPending, false},
+	} {
+		t.Run(string(tt.from)+" to "+string(tt.to), func(t *testing.T) {
+			bot := newTestBot(t)
+			requireNoError(t, bot.db.Exec("INSERT INTO members(id, name, available) VALUES ('m', 'member', 1)").Error)
+			requireNoError(t, bot.db.Exec("INSERT INTO projects(uuid, name) VALUES ('p', 'project')").Error)
+			requireNoError(t, bot.db.Exec("INSERT INTO tasks(uuid, project_id, allocated_member_id, status) VALUES ('t', 'p', 'm', ?)", tt.from).Error)
+
+			err := bot.db.Exec(`UPDATE tasks SET status = ?, "desc" = 'updated' WHERE uuid = 't'`, tt.to).Error
+			wantStatus, wantDesc := tt.to, "updated"
+			if tt.rejected {
+				var sqliteErr sqlite3.Error
+				if !errors.As(err, &sqliteErr) || sqliteErr.ExtendedCode != sqlite3.ErrConstraintTrigger {
+					t.Fatalf("transition = %v, want SQLite trigger constraint violation", err)
+				}
+				wantStatus, wantDesc = tt.from, ""
+			} else {
+				requireNoError(t, err)
+			}
+			var task Task
+			requireNoError(t, bot.db.First(&task).Error)
+			if task.Status != wantStatus || task.Desc != wantDesc {
+				t.Fatalf("task after transition = %+v, want status %q and description %q", task, wantStatus, wantDesc)
+			}
+		})
+	}
+}
+
+func TestBotAcceptedTaskCanUpdateOtherFields(t *testing.T) {
+	bot := newTestBot(t)
+	requireNoError(t, bot.db.Exec("INSERT INTO members(id, name, available) VALUES ('m', 'member', 1)").Error)
+	requireNoError(t, bot.db.Exec("INSERT INTO projects(uuid, name) VALUES ('p', 'project')").Error)
+	requireNoError(t, bot.db.Exec("INSERT INTO tasks(uuid, project_id, allocated_member_id, status) VALUES ('t', 'p', 'm', ?)", TaskAccepted).Error)
+	requireNoError(t, bot.db.Exec(`UPDATE tasks SET "desc" = 'updated' WHERE uuid = 't'`).Error)
+
+	var task Task
+	requireNoError(t, bot.db.First(&task).Error)
+	if task.Status != TaskAccepted || task.Desc != "updated" {
+		t.Fatalf("task after updating description = %+v", task)
+	}
+}

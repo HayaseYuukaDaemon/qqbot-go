@@ -87,7 +87,31 @@ func (kb *KivoBot) initDB(dbPath string) error {
 		return fmt.Errorf("failed to create db trigger task_member_available_on_update: %w", err)
 	}
 
+	// 状态流转需要同时检查更新前后的值，由触发器在数据库层约束。
+	if err := db.Exec(`
+		CREATE TRIGGER IF NOT EXISTS task_accepted_transition_on_update
+		BEFORE UPDATE OF status ON tasks
+		WHEN NEW.status = 'accepted'
+		 AND OLD.status NOT IN ('allocated', 'pending', 'blocked')
+		BEGIN
+			SELECT RAISE(ABORT, 'task can only transition to accepted from allocated, pending or blocked');
+		END;
+	`).Error; err != nil {
+		return fmt.Errorf("failed to create db trigger task_accepted_transition_on_update: %w", err)
+	}
+
 	kb.db = db
+	return nil
+}
+
+func (kb *KivoBot) AcceptTask(ctx context.Context, taskID string) error {
+	rows, err := gorm.G[Task](kb.db).Where("id = ?", taskID).Update(ctx, "status", TaskAccepted)
+	if err != nil {
+		return fmt.Errorf("failed to accept task: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("task not found")
+	}
 	return nil
 }
 
