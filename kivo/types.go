@@ -5,15 +5,6 @@ import (
 	"time"
 )
 
-type Capability string
-
-const (
-	FormFilling   Capability = "form_filling"
-	Translator    Capability = "translator"
-	Assistant     Capability = "assistant"
-	Administrator Capability = "admin"
-)
-
 type BotConfig struct {
 	DBPath string `json:"db_path"`
 	Debug  bool   `json:"debug"`
@@ -22,53 +13,51 @@ type BotConfig struct {
 	Logger *slog.Logger `json:"-"`
 }
 
+type Capability struct {
+	Name string `json:"name" gorm:"name"`
+}
+
 type Member struct {
-	Name      string `json:"name" gorm:"unique"`
-	ID        string `json:"id" gorm:"primaryKey"` // 设计为qq号
-	Available bool   `json:"available"`
+	Name string `json:"name" gorm:"unique"`
+	ID   string `json:"id" gorm:"primaryKey"` // 设计为qq号
 
-	Capabilities []Capability `gorm:"-"`
+	Capabilities []Capability
 }
 
-type memberCapability struct {
-	MemberID   string     `gorm:"primaryKey"`
-	Capability Capability `gorm:"primaryKey"`
-
-	Member Member `gorm:"foreignKey:MemberID"`
+type IsAvailable interface {
+	IsAvailable() bool
 }
+
+// 再加一个保存member不可用时间表的数据表
 
 type Project struct {
 	UUID string `json:"uuid" gorm:"primaryKey"`
 	Name string `json:"name"`
 	Desc string `json:"desc"`
 
-	RequiredCapabilities []Capability `json:"required_capabilities" gorm:"-"`
+	RequiredCapabilities []Capability `json:"required_capabilities"`
 
 	// 周期属性
 	StartAt  *time.Time     `json:"start_at"` // 项目开始于
 	EndAt    *time.Time     `json:"end_at"`   // 项目终止于
 	Interval *time.Duration `json:"interval"` // 周期性项目的Interval
 
+	// task 属性
+	OfferingExpire *time.Duration `json:"offering_expire"` // 单次分配允许等待的最大时长
+	Deadline       *time.Duration `json:"deadline"`        // 自对应 task 创建开始, 在此时间内必须完成
+
 	RelatedPaths []string `json:"related_paths" gorm:"serializer:json;type:text"`
-}
-
-type projectCapability struct {
-	ProjectID  string     `gorm:"primaryKey"`
-	Capability Capability `gorm:"primaryKey"`
-
-	Project Project `gorm:"foreignKey:ProjectID;references:UUID"`
 }
 
 type TaskStatus string
 
 const (
-	TaskAllocated TaskStatus = "allocated"
-	TaskAccepted  TaskStatus = "accepted"
 	TaskPending   TaskStatus = "pending"
+	TaskAssigned  TaskStatus = "assigned"
 	TaskRunning   TaskStatus = "running"
-	TaskBlocked   TaskStatus = "blocked"
-	TaskCancelled TaskStatus = "cancelled"
 	TaskCompleted TaskStatus = "completed"
+	TaskCancelled TaskStatus = "cancelled"
+	TaskFailed    TaskStatus = "failed"
 )
 
 type Task struct {
@@ -76,25 +65,45 @@ type Task struct {
 	Desc      string     `json:"desc"`
 	CreatedAt time.Time  `json:"created_at"` // 任务创建即视为开始
 	UpdatedAt time.Time  `json:"updated_at"` // 状态等变更
-	EndAt     time.Time  `json:"end_at"`     // 任务截止日期, 带interval的project直接用created+interval
-	Status    TaskStatus `json:"status" gorm:"not null;default:allocated;check:task_status_check,status IN ('allocated','accepted','pending','running','blocked','cancelled','completed');check:task_allocation_check,allocated_member_id IS NOT NULL OR status IN ('pending','cancelled')"`
+	Status    TaskStatus `json:"status" gorm:"not null;default:null"`
 
-	ProjectID string  `json:"project_id" gorm:"not null;default:null"`
+	ProjectID string  `json:"-" gorm:"not null;default:null"`
 	Project   Project `json:"project" gorm:"foreignKey:ProjectID;references:UUID;constraint:OnDelete:RESTRICT"`
 
-	AllocatedMemberID *string `json:"allocated_member_id"` // 可空, 如果为空则说明未分配
-	AllocatedMember   *Member `json:"allocated_member" gorm:"foreignKey:AllocatedMemberID;references:ID;constraint:OnDelete:SET NULL"`
-
 	RelatedPath []string `json:"related_path" gorm:"serializer:json;type:text"`
+}
+
+type AllocationStatus string
+
+const (
+	AllocationOffered   AllocationStatus = "offered"
+	AllocationAccepted  AllocationStatus = "accepted"
+	AllocationRejected  AllocationStatus = "rejected"
+	AllocationExpired   AllocationStatus = "expired"
+	AllocationCancelled AllocationStatus = "cancelled"
+)
+
+type Allocation struct {
+	ID        string           `json:"id" gorm:"primaryKey"`
+	CreatedAt time.Time        `json:"created_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
+	Status    AllocationStatus `json:"status" gorm:"not null;default:offered"`
+
+	MemberID string `json:"-" gorm:"not null;default:null"`
+	Member   Member `json:"member" gorm:"foreignKey:MemberID;references:ID;constraint:OnDelete:RESTRICT"`
+
+	TaskID string `json:"-" gorm:"not null;default:null"`
+	Task   Task   `json:"task" gorm:"foreignKey:TaskID;references:UUID;constraint:OnDelete:RESTRICT"`
 }
 
 type MotionType string
 
 const (
-	Notify          MotionType = "notify"
-	AccepetAllocate MotionType = "accept_allocate"
-	RejectAllocate  MotionType = "reject_allocate"
-	SwitchRequest   MotionType = "switch_request"
+	Notify         MotionType = "notify"
+	AcceptAllocate MotionType = "accept_allocate"
+	RejectAllocate MotionType = "reject_allocate"
+	SwitchRequest  MotionType = "switch_request"
+	ReserveRequest MotionType = "reserve_request"
 )
 
 type Motion struct {
